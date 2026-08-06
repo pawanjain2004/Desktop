@@ -2,8 +2,8 @@
 """
 Reflection-mode vein finder for Raspberry Pi Camera Module 3 NoIR.
 
-Pipeline: capture IR frame → grayscale → median filter → CLAHE → median filter
-→ adaptive threshold → morphology → edge enhance → side-by-side display.
+Pipeline: capture IR frame → grayscale → median → CLAHE → hand-interior mask
+→ Frangi vesselness (boundary suppressed) → soft green overlay on vessels.
 
 Modes:
   Local display:  python3 vein_finder.py
@@ -28,50 +28,190 @@ import numpy as np
 from picamera2 import Picamera2
 
 
+def frangi_vesselness(
+    image: np.ndarray,
+    sigmas: tuple[float, ...] = (1.0, 1.5, 2.0, 2.5, 3.0),
+    beta: float = 0.5,
+    c: float = 0.5,
+) -> np.ndarray:
+    """Multi-scale Frangi for dark tubular veins. Returns uint8 0–255."""
+    img = 1.0 - (image.astype(np.float64) / 255.0)
+    max_response = np.zeros_like(img)
+
+    for sigma in sigmas:
+        ksize = max(3, int(6 * sigma + 1)) | 1
+        smoothed = cv2.GaussianBlur(img, (ksize, ksize), sigmaX=sigma, sigmaY=sigma)
+
+        dxx = cv2.Sobel(smoothed, cv2.CV_64F, 2, 0, ksize=3)
+        dyy = cv2.Sobel(smoothed, cv2.CV_64F, 0, 2, ksize=3)
+        dxy = cv2.Sobel(smoothed, cv2.CV_64F, 1, 1, ksize=3)
+
+        scale = sigma * sigma
+        dxx *= scale
+        dyy *= scale
+        dxy *= scale
+
+        tmp = np.sqrt(((dxx - dyy) * 0.5) ** 2 + dxy * dxy)
+        mu1 = 0.5 * (dxx + dyy) + tmp
+        mu2 = 0.5 * (dxx + dyy) - tmp
+
+        swap = np.abs(mu1) > np.abs(mu2)
+        lambda1 = np.where(swap, mu2, mu1)
+        lambda2 = np.where(swap, mu1, mu2)
+
+        abs_l1 = np.abs(lambda1)
+        abs_l2 = np.abs(lambda2)
+        rb = abs_l1 / (abs_l2 + 1e-10)
+        s2 = abs_l1 * abs_l1 + abs_l2 * abs_l2
+
+        response = np.exp(-(rb * rb) / (2 * beta * beta))
+        response *= 1.0 - np.exp(-s2 / (2 * c * c))
+        response[lambda2 >= 0] = 0.0
+
+        max_response = np.maximum(max_response, response)
+
+    peak = float(max_response.max())
+    if peak > 1e-8:
+        return (max_response / peak * 255.0).astype(np.uint8)
+    return np.zeros_like(image, dtype=np.uint8)
+
+
+def hand_interior_mask(gray: np.ndarray, border_px: int = 28) -> np.ndarray:
+    """Segment the arm/hand and exclude silhouette band from detection."""
+    blur = cv2.GaussianBlur(gray, (11, 11), 0)
+    _, mask = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    if np.any(mask > 0) and np.any(mask == 0):
+        if gray[mask > 0].mean() < gray[mask == 0].mean():
+            mask = cv2.bitwise_not(mask)
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num > 1:
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        best = 1 + int(np.argmax(areas))
+        mask = np.where(labels == best, 255, 0).astype(np.uint8)
+
+    fill = mask.copy()
+    h, w = fill.shape
+    ff_mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(fill, ff_mask, (0, 0), 128)
+    holes = np.where(fill == 0, 255, 0).astype(np.uint8)
+    mask = cv2.bitwise_or(mask, holes)
+
+    dist = cv2.distanceTransform(mask, cv2.DIST_L2, 5)
+    return np.where(dist >= float(border_px), 255, 0).astype(np.uint8)
+
+
+def suppress_boundary_responses(
+    vesselness: np.ndarray, gray: np.ndarray, interior: np.ndarray
+) -> np.ndarray:
+    """Kill silhouette / strong-edge Frangi hits; keep faint interior ridges."""
+    out = vesselness.copy()
+    out[interior == 0] = 0
+
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.magnitude(gx, gy)
+    if np.any(interior > 0):
+        edge_thr = float(np.percentile(mag[interior > 0], 97))
+        out[mag >= edge_thr] = 0
+
+    local = cv2.GaussianBlur(gray, (25, 25), 0)
+    darker = gray.astype(np.int16) <= (local.astype(np.int16) + 1)
+    out[~darker] = 0
+    return out
+
+
 def enhance_veins(
-    gray: np.ndarray, clahe, median_ksize: int = 5
-) -> tuple[np.ndarray, np.ndarray]:
-    """Return (enhanced grayscale, binary vein mask)."""
+    gray: np.ndarray,
+    clahe,
+    median_ksize: int = 5,
+    frangi_scale: float = 0.5,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns:
+      enhanced: CLAHE with mild vein darkening
+      binary: hard mask (debug)
+      vesselness: continuous Frangi map for soft green overlay
+    """
     denoised = cv2.medianBlur(gray, median_ksize)
     eq = clahe.apply(denoised)
     filtered = cv2.medianBlur(eq, 3)
 
-    inv = cv2.bitwise_not(filtered)
+    interior = hand_interior_mask(denoised, border_px=28)
 
-    binary = cv2.adaptiveThreshold(
-        inv,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        21,
-        4,
-    )
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    h, w = filtered.shape
+    if frangi_scale < 1.0:
+        small = cv2.resize(
+            filtered,
+            (max(1, int(w * frangi_scale)), max(1, int(h * frangi_scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        vessel_small = frangi_vesselness(small)
+        vesselness = cv2.resize(vessel_small, (w, h), interpolation=cv2.INTER_LINEAR)
+    else:
+        vesselness = frangi_vesselness(filtered)
 
-    edges = cv2.Laplacian(filtered, cv2.CV_16S, ksize=3)
-    edges = cv2.convertScaleAbs(edges)
-    enhanced = cv2.addWeighted(eq, 0.75, edges, 0.45, 0)
-    enhanced = cv2.bitwise_not(enhanced)
+    vesselness = suppress_boundary_responses(vesselness, filtered, interior)
+    vesselness = cv2.bitwise_and(vesselness, interior)
 
-    return enhanced, binary
+    if np.any(vesselness > 0):
+        peak = float(vesselness.max())
+        vesselness = (vesselness.astype(np.float32) / peak * 255.0).astype(np.uint8)
+
+    strength = vesselness.astype(np.float32) / 255.0
+    boosted = filtered.astype(np.float32) * (1.0 - 0.30 * strength)
+    p2, p98 = np.percentile(boosted, (2, 98))
+    if p98 > p2:
+        boosted = np.clip((boosted - p2) * (255.0 / (p98 - p2)), 0, 255)
+    enhanced = boosted.astype(np.uint8)
+
+    # Low threshold so faint central veins still light up green
+    if np.any(vesselness > 0):
+        thr = int(np.percentile(vesselness[vesselness > 0], 40))
+        thr = max(12, min(thr, 40))
+    else:
+        thr = 18
+    _, binary = cv2.threshold(vesselness, thr, 255, cv2.THRESH_BINARY)
+    binary = cv2.bitwise_and(binary, interior)
+    open_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, open_k, iterations=1)
+
+    return enhanced, binary, vesselness
 
 
-def overlay_veins(bgr: np.ndarray, binary: np.ndarray) -> np.ndarray:
-    """Tint detected vein pixels green on the original frame."""
-    out = bgr.copy()
-    mask = binary > 0
-    out[mask] = (0, 220, 80)
-    return cv2.addWeighted(bgr, 0.55, out, 0.45, 0)
+def overlay_veins_soft(
+    bgr: np.ndarray, vesselness: np.ndarray, thr: int = 15
+) -> np.ndarray:
+    """Soft green proportional to Frangi strength (shows faint veins)."""
+    out = bgr.astype(np.float32)
+    v = vesselness.astype(np.float32)
+    alpha = np.clip((v - float(thr)) / max(1.0, 255.0 - float(thr)), 0.0, 1.0)
+    alpha = np.power(alpha, 0.55)  # lift mid responses into visible green
+    alpha3 = alpha[:, :, None]
+
+    green = out.copy()
+    green[:, :, 0] = out[:, :, 0] * 0.12
+    green[:, :, 1] = np.clip(out[:, :, 1] * 0.20 + 235.0, 0, 255)
+    green[:, :, 2] = out[:, :, 2] * 0.12
+
+    return (out * (1.0 - alpha3) + green * alpha3).astype(np.uint8)
 
 
-def build_view(mode, bgr, gray, enhanced, binary, width):
-    """Build the side-by-side frame (raw | processed)."""
+def build_view(mode, bgr, gray, enhanced, binary, vesselness, width):
+    """Build side-by-side frame: raw | Frangi soft-green veins."""
+    if np.any(vesselness > 0):
+        thr = max(10, int(np.percentile(vesselness[vesselness > 0], 35)))
+    else:
+        thr = 15
+    thr = min(thr, 35)
+
     if mode == "enhanced":
-        view = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        view = overlay_veins_soft(
+            cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR), vesselness, thr=thr
+        )
     elif mode == "overlay":
-        view = overlay_veins(bgr, binary)
+        view = overlay_veins_soft(bgr, vesselness, thr=thr)
     elif mode == "binary":
         view = cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
     else:
@@ -98,6 +238,12 @@ def parse_args() -> argparse.Namespace:
         default=5,
         choices=(3, 5, 7),
         help="Median filter kernel size for noise reduction",
+    )
+    p.add_argument(
+        "--frangi-scale",
+        type=float,
+        default=0.5,
+        help="Frangi processing scale 0.25–1.0 (lower = faster)",
     )
     p.add_argument(
         "--stream",
@@ -153,8 +299,12 @@ def run_local(args, picam, clahe):
             rgb = picam.capture_array()
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            enhanced, binary = enhance_veins(gray, clahe, args.median_size)
-            combo = build_view(mode, bgr, gray, enhanced, binary, args.width)
+            enhanced, binary, vesselness = enhance_veins(
+                gray, clahe, args.median_size, args.frangi_scale
+            )
+            combo = build_view(
+                mode, bgr, gray, enhanced, binary, vesselness, args.width
+            )
 
             frames += 1
             now = time.time()
@@ -163,13 +313,13 @@ def run_local(args, picam, clahe):
                 frames = 0
                 fps_t0 = now
 
-            label = f"{mode} | {fps:.0f} FPS | 1-4 modes | q quit"
+            label = f"{mode} | {fps:.0f} FPS | Frangi | 1-4 modes | q quit"
             cv2.putText(combo, label, (12, 28),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (40, 255, 40), 2, cv2.LINE_AA)
             cv2.putText(combo, "RAW IR", (12, 56),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
-            cv2.putText(combo, "PROCESSED", (args.width + 12, 56),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1, cv2.LINE_AA)
+            cv2.putText(combo, "FRANGI + GREEN VEINS", (args.width + 12, 56),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 220, 80), 1, cv2.LINE_AA)
 
             cv2.imshow(win, combo)
             key = cv2.waitKey(1) & 0xFF
@@ -214,12 +364,18 @@ def run_stream(args, picam, clahe):
         print("Disconnected from dashboard, will retry...")
 
     print(f"Connecting to {args.server} ...")
-    try:
-        client.connect(args.server, transports=["websocket"])
-    except Exception as e:
-        print(f"Cannot connect to {args.server}: {e}")
-        print("Start the dashboard server first, or check the URL.")
-        return
+    while True:
+        try:
+            client.connect(
+                args.server,
+                transports=["polling", "websocket"],
+                wait_timeout=30,
+            )
+            break
+        except Exception as e:
+            print(f"Cannot connect to {args.server}: {e}")
+            print("Retrying in 15 seconds...")
+            time.sleep(15)
 
     mode = args.mode
     fps_t0 = time.time()
@@ -235,8 +391,12 @@ def run_stream(args, picam, clahe):
             rgb = picam.capture_array()
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
             gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-            enhanced, binary = enhance_veins(gray, clahe, args.median_size)
-            combo = build_view(mode, bgr, gray, enhanced, binary, args.width)
+            enhanced, binary, vesselness = enhance_veins(
+                gray, clahe, args.median_size, args.frangi_scale
+            )
+            combo = build_view(
+                mode, bgr, gray, enhanced, binary, vesselness, args.width
+            )
 
             frames += 1
             now = time.time()
@@ -248,6 +408,11 @@ def run_stream(args, picam, clahe):
             if now - last_send < frame_interval:
                 continue
             last_send = now
+
+            cv2.putText(combo, "RAW IR", (12, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 2, cv2.LINE_AA)
+            cv2.putText(combo, "FRANGI + GREEN VEINS", (args.width + 12, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 220, 80), 2, cv2.LINE_AA)
 
             _, buf = cv2.imencode(
                 ".jpg", combo, [cv2.IMWRITE_JPEG_QUALITY, args.jpeg_quality]
@@ -269,7 +434,8 @@ def run_stream(args, picam, clahe):
 
 def main() -> int:
     args = parse_args()
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8, 8))
+    args.frangi_scale = max(0.25, min(1.0, args.frangi_scale))
 
     picam = Picamera2()
     config = picam.create_preview_configuration(

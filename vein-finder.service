@@ -1,0 +1,18 @@
+[Unit]
+Description=Vein Finder - stream to Render dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+WorkingDirectory=/home/admin/Desktop
+Environment=STREAM_TOKEN=admin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/admin/Desktop/vein_finder.py --stream --server https://desktop-vxnj.onrender.com --token admin
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
