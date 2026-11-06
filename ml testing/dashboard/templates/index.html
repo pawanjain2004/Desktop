@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vein Finder Dashboard</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #0a0e17;
+      color: #e0e6f0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    header {
+      background: #111827;
+      border-bottom: 1px solid #1e293b;
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    header h1 {
+      font-size: 20px;
+      font-weight: 600;
+      color: #f0f4f8;
+    }
+
+    .status-bar {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      font-size: 13px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+    }
+
+    .dot-disconnected { background: #ef4444; }
+    .dot-connected { background: #22c55e; animation: pulse 2s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.5; }
+    }
+
+    .badge {
+      background: #1e293b;
+      padding: 4px 12px;
+      border-radius: 6px;
+      font-family: 'JetBrains Mono', monospace;
+    }
+
+    main {
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+    }
+
+    .stream-container {
+      position: relative;
+      background: #111827;
+      border: 1px solid #1e293b;
+      border-radius: 12px;
+      overflow: hidden;
+      max-width: 1400px;
+      width: 100%;
+    }
+
+    #stream {
+      width: 100%;
+      display: block;
+      min-height: 300px;
+      object-fit: contain;
+      background: #0f172a;
+    }
+
+    .placeholder {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 400px;
+      color: #64748b;
+      gap: 12px;
+    }
+
+    .placeholder svg {
+      width: 64px;
+      height: 64px;
+      opacity: 0.4;
+    }
+
+    .placeholder p { font-size: 15px; }
+
+    .stream-overlay {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      display: flex;
+      gap: 8px;
+    }
+
+    .overlay-badge {
+      background: rgba(0, 0, 0, 0.7);
+      backdrop-filter: blur(8px);
+      padding: 4px 10px;
+      border-radius: 6px;
+      font-size: 12px;
+      font-family: 'JetBrains Mono', monospace;
+      color: #a5f3fc;
+    }
+
+    footer {
+      background: #111827;
+      border-top: 1px solid #1e293b;
+      padding: 12px 24px;
+      text-align: center;
+      font-size: 12px;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Vein Finder Dashboard</h1>
+    <div class="status-bar">
+      <span>
+        <span class="status-dot dot-disconnected" id="statusDot"></span>
+        <span id="statusText">Disconnected</span>
+      </span>
+      <span class="badge" id="fpsDisplay">-- FPS</span>
+      <span class="badge" id="modeDisplay">--</span>
+    </div>
+  </header>
+
+  <main>
+    <div class="stream-container">
+      <div class="placeholder" id="placeholder">
+        <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+            d="M15.75 10.5l4.72-4.72a.75.75 0 011.28.53v11.38a.75.75 0 01-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 002.25-2.25v-9A2.25 2.25 0 0013.5 5.25h-9A2.25 2.25 0 002.25 7.5v9a2.25 2.25 0 002.25 2.25z" />
+        </svg>
+        <p>Waiting for Pi to connect...</p>
+        <p style="font-size:12px; color:#475569;">Make sure vein_finder.py is running with --stream</p>
+      </div>
+      <img id="stream" style="display:none;" alt="Vein detection stream">
+      <div class="stream-overlay" id="overlay" style="display:none;">
+        <span class="overlay-badge" id="overlayFps">-- FPS</span>
+        <span class="overlay-badge" id="overlayMode">--</span>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    Raspberry Pi Camera Module 3 NoIR &middot; IR Reflection Vein Detection
+  </footer>
+
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const socket = io();
+    const streamImg = document.getElementById('stream');
+    const placeholder = document.getElementById('placeholder');
+    const overlay = document.getElementById('overlay');
+    const statusDot = document.getElementById('statusDot');
+    const statusText = document.getElementById('statusText');
+    const fpsDisplay = document.getElementById('fpsDisplay');
+    const modeDisplay = document.getElementById('modeDisplay');
+    const overlayFps = document.getElementById('overlayFps');
+    const overlayMode = document.getElementById('overlayMode');
+
+    let lastFrameTime = 0;
+    let browserFps = 0;
+    let frameCount = 0;
+    let fpsTimer = setInterval(() => {
+      browserFps = frameCount;
+      frameCount = 0;
+    }, 1000);
+
+    socket.on('connect', () => {
+      statusDot.className = 'status-dot dot-connected';
+      statusText.textContent = 'Connected';
+    });
+
+    socket.on('disconnect', () => {
+      statusDot.className = 'status-dot dot-disconnected';
+      statusText.textContent = 'Disconnected';
+      streamImg.style.display = 'none';
+      placeholder.style.display = 'flex';
+      overlay.style.display = 'none';
+    });
+
+    socket.on('frame', (data) => {
+      if (!data || !data.data) return;
+
+      streamImg.src = 'data:image/jpeg;base64,' + data.data;
+      streamImg.style.display = 'block';
+      placeholder.style.display = 'none';
+      overlay.style.display = 'flex';
+
+      frameCount++;
+
+      const piFps = data.fps ? Math.round(data.fps) : '--';
+      const mode = data.mode || '--';
+
+      fpsDisplay.textContent = piFps + ' FPS (Pi)';
+      modeDisplay.textContent = mode;
+      overlayFps.textContent = piFps + ' FPS';
+      overlayMode.textContent = mode;
+    });
+  </script>
+</body>
+</html>
